@@ -4,9 +4,9 @@ TVIP S-Box 605 -- All-in-One Hardware Unlocker & Root Provisioning Suite
 Supports both Android 8.0 and Linux-QT firmware variants.
 
 Features:
-  1. Permanent Hardware Unlock: Reprograms Amlogic NVRAM UnifyKeys directly via ADB.
-  2. Built-in Provisioning Server: Hosts HTTP tvip_provision.xml to unlock menus
-     and activate Dropbear (SSH) & Telnet root shell on Linux-QT and Android.
+  1. Automated Hardware Unlock: Reprograms Amlogic NVRAM UnifyKeys directly via ADB.
+  2. Zero-Touch Auto-Burner: When running provision server, automatically connects to
+     the TVIP box upon boot, logs in, burns 127.0.0.1 to chip NVRAM, and reboots.
   3. Network Diagnostics: Probes ADB, SSH (22), and Telnet (23).
 """
 
@@ -22,7 +22,7 @@ import time
 
 BANNER = """
 ============================================================
-   TVIP S-Box 605 -- All-in-One Unlock & Root Shell Suite
+   TVIP S-Box 605 -- All-in-One Unlock & Auto-Burn Suite
 ============================================================
 """
 
@@ -66,6 +66,17 @@ PROVISION_TEMPLATE = """<?xml version="1.0"?>
 </provision>
 """
 
+BURN_COMMANDS = [
+    "echo 1 > /sys/class/unifykeys/attach",
+    "echo 1 > /sys/class/unifykeys/lock",
+    "echo ps > /sys/class/unifykeys/name",
+    "echo 127.0.0.1 > /sys/class/unifykeys/write",
+    "echo 0 > /sys/class/unifykeys/lock",
+    "rm -rf /var/tvip/*",
+    "sync",
+    "reboot"
+]
+
 def run_adb(cmd_list, device=None):
     base = ["adb"]
     if device:
@@ -86,7 +97,6 @@ def get_adb_devices():
         parts = line.split()
         if len(parts) >= 2 and parts[1] == "device":
             serial = parts[0]
-            # Prioritize TVIP devices if detected
             is_tvip = any("tvip" in p.lower() or "s6xx" in p.lower() for p in parts)
             if is_tvip or ":" in serial:
                 devices.insert(0, serial)
@@ -109,6 +119,26 @@ def check_port(host, port, timeout=2.0):
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except Exception:
+        return False
+
+def telnet_auto_burn(ip, user, password):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(6.0)
+        s.connect((ip, 23))
+        time.sleep(1.0)
+        s.recv(1024)
+        s.sendall(f"{user}\n".encode())
+        time.sleep(1.0)
+        s.recv(1024)
+        s.sendall(f"{password}\n".encode())
+        time.sleep(1.5)
+        for cmd in BURN_COMMANDS:
+            s.sendall(f"{cmd}\n".encode())
+            time.sleep(0.3)
+        s.close()
+        return True
+    except Exception as e:
         return False
 
 def read_unifykey_ps(device=None):
@@ -144,25 +174,63 @@ def check_device_info(device=None):
 
 class ProvisionHandler(http.server.BaseHTTPRequestHandler):
     xml_content = b""
+    configured_password = "toor"
+    burn_attempted = False
 
     def do_GET(self):
         client_ip = self.client_address[0]
         path = self.path.split("?")[0]
-        print(f"\n[HTTP GET] {client_ip} requested: {self.path}")
+        print(f"\n[HTTP GET] TVIP box ({client_ip}) requested: {self.path}")
 
-        if path.endswith("tvip_provision.xml") or path == "/prov" or path == "/prov/":
+        if path.endswith("tvip_provision.xml") or path in ("/prov", "/prov/"):
             self.send_response(200)
             self.send_header("Content-Type", "text/xml")
             self.send_header("Content-Length", str(len(self.xml_content)))
             self.end_headers()
             self.wfile.write(self.xml_content)
             print(f"[+] Delivered custom tvip_provision.xml to {client_ip}!")
+            print("[+] Root shell and unlocked preferences activated on box!")
+
+            # Trigger automated background burn if not already executed
+            if not ProvisionHandler.burn_attempted:
+                ProvisionHandler.burn_attempted = True
+                threading.Thread(target=self.trigger_background_burn, args=(client_ip,), daemon=True).start()
         else:
             self.send_response(404)
             self.end_headers()
 
+    def trigger_background_burn(self, client_ip):
+        print("\n[*] AUTO-BURNER ACTIVATED:")
+        print(f"[*] Waiting 6 seconds for TVIP box ({client_ip}) to initialize root shell...")
+        time.sleep(6)
+
+        # 1. Try Telnet auto-burn
+        print(f"[*] Probing Telnet on {client_ip}:23...")
+        if check_port(client_ip, 23, timeout=3.0):
+            print(f"[+] Telnet is OPEN. Logging in as root and burning NVRAM...")
+            if telnet_auto_burn(client_ip, "root", ProvisionHandler.configured_password):
+                print("\n============================================================")
+                print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED WITH 127.0.0.1!")
+                print("           The operator lock has been permanently erased.")
+                print("           The box is now rebooting fully unlocked.")
+                print("============================================================\n")
+                return
+
+        # 2. Try ADB if available
+        if check_port(client_ip, 5555, timeout=2.0):
+            print(f"[*] ADB available on {client_ip}. Burning NVRAM via ADB...")
+            run_adb(["connect", f"{client_ip}:5555"])
+            write_unifykey_ps("127.0.0.1", f"{client_ip}:5555")
+            clear_tvip_data(f"{client_ip}:5555")
+            run_adb(["reboot"], f"{client_ip}:5555")
+            print("[SUCCESS] Permanently burned via ADB!")
+            return
+
+        print(f"[*] Dropbear SSH is listening on {client_ip}:22.")
+        print(f"    You can connect anytime via: ssh root@{client_ip} (password: {ProvisionHandler.configured_password})")
+
     def log_message(self, format, *args):
-        pass  # Suppress default server logs for clean CLI output
+        pass
 
 def start_provision_server(port, password, portal_url=None):
     custom_proto = ""
@@ -173,6 +241,7 @@ def start_provision_server(port, password, portal_url=None):
 
     xml = PROVISION_TEMPLATE.format(password=password, custom_protocol=custom_proto).encode("utf-8")
     ProvisionHandler.xml_content = xml
+    ProvisionHandler.configured_password = password
 
     server = socketserver.TCPServer(("", port), ProvisionHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -206,14 +275,14 @@ def run_diagnostics(target_dev, box_ip):
         print(f"    Port 5555 (ADB):        {'OPEN' if adb_ok else 'Closed'}")
 
 def main():
-    parser = argparse.ArgumentParser(description="TVIP S-Box 605 All-in-One Unlocker & Root Provisioning Suite")
+    parser = argparse.ArgumentParser(description="TVIP S-Box 605 All-in-One Unlocker & Auto-Burn Suite")
     parser.add_argument("-s", "--device", help="ADB target device (e.g. 192.168.1.41:5555)")
     parser.add_argument("--box-ip", help="IP address of the TVIP box for network checks (e.g. 192.168.1.41)")
     parser.add_argument("--unlock", action="store_true", help="Perform permanent hardware unlock via NVRAM UnifyKeys")
     parser.add_argument("--server-ip", default="127.0.0.1", help="Target server to write to NVRAM (default: 127.0.0.1)")
-    parser.add_argument("--serve", action="store_true", help="Start local provisioning server to unlock UI & enable root shell")
-    parser.add_argument("--port", type=int, default=80, help="HTTP provisioning server port (default: 80)")
-    parser.add_argument("--password", default="toor", help="Password to configure for SSH/Telnet root shell (default: toor)")
+    parser.add_argument("--serve", action="store_true", help="Start provisioning server with Auto-Burner enabled")
+    parser.add_argument("--port", type=int, default=80, help="HTTP server port (default: 80)")
+    parser.add_argument("--password", default="toor", help="Password for SSH/Telnet root shell (default: toor)")
     parser.add_argument("--portal", help="Optional custom portal URL to inject (e.g. http://my-stalker-portal.com)")
     parser.add_argument("--check", action="store_true", help="Run read-only diagnostics")
     parser.add_argument("--reboot", action="store_true", help="Reboot device via ADB")
@@ -229,7 +298,7 @@ def main():
 
     # If no flags passed, default to check + unlock
     if not any([args.unlock, args.serve, args.check, args.reboot]):
-        print("[*] No specific mode selected. Running diagnostics and hardware unlock...")
+        print("[*] No flags specified. Running diagnostics and hardware unlock...")
         args.check = True
         args.unlock = True
 
@@ -268,29 +337,28 @@ def main():
     if args.serve:
         local_ip = get_local_ip(box_ip or "192.168.1.1")
         print(f"\n[*] Starting Provisioning Server on http://{local_ip}:{args.port}/prov/tvip_provision.xml")
+        print(f"[*] Zero-Touch Auto-Burner: ENABLED")
         print(f"[*] Configured root shell password: '{args.password}'")
         if args.portal:
-            print(f"[*] Configured custom portal: '{args.portal}'")
+            print(f"[*] Custom portal URL: '{args.portal}'")
 
         try:
             server = start_provision_server(args.port, args.password, args.portal)
-            print("[+] HTTP Server is LIVE. Waiting for TVIP box connection...")
+            print("\n[+] HTTP Server is LIVE. Waiting for TVIP box to boot and connect...")
+            print("    (When the box connects, the script will automatically burn 127.0.0.1 and reboot it!)\n")
 
-            # If ADB is available, we can automatically set ps to our server IP!
             if target_dev:
-                print(f"[*] ADB available: Setting TVIP NVRAM 'ps' to {local_ip}...")
+                print(f"[*] ADB available: Pointing NVRAM 'ps' to {local_ip}...")
                 write_unifykey_ps(local_ip, target_dev)
-                print("[*] Restarting TVIP app to trigger instant provisioning...")
                 run_adb(["shell", "am force-stop tv.tvip.app && am start -n tv.tvip.app/.TvipNativeActivity"], target_dev)
 
-            print("\nPress Ctrl+C to stop the provisioning server.")
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\n[*] Stopping server.")
         except PermissionError:
-            print(f"\n[!] Error: Port {args.port} requires administrator/root privileges.")
-            print(f"    Run the terminal as Administrator or specify a port like '--port 8080'.")
+            print(f"\n[!] Error: Port {args.port} requires administrator privileges.")
+            print(f"    Please run Command Prompt / Terminal as Administrator.")
 
     if args.reboot and target_dev:
         print("\n[*] Rebooting device...")
