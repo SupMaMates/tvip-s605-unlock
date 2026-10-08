@@ -18,8 +18,8 @@ python tvip_s605_unlock.py --hotspot
 ```
 
 The script will automatically:
-1. Turn on Windows Mobile Hotspot.
-2. Display your PC's Wi-Fi network name (SSID) and Password.
+1. Configure your Windows Hotspot network to **`TVIP-UNLOCK`** with the simplest possible password: **`12345678`** (typed easily with remote number keys 1–8).
+2. Turn on Windows Mobile Hotspot.
 3. Automatically redirect operator domains (`dreambox.for-better.biz`, `tvipstb.net`, `update.tvip.ru`) to your PC.
 4. Launch the custom provisioning server on Port 80 with the **Zero-Touch Auto-Burner** active.
 
@@ -27,15 +27,16 @@ The script will automatically:
 ============================================================
           WINDOWS MOBILE HOTSPOT IS READY!
 ============================================================
-  Wi-Fi Network (SSID): DESKTOP-XXXXXX 0915
-  Wi-Fi Password:       4<95Tg56
+  Wi-Fi Network (SSID): TVIP-UNLOCK
+  Wi-Fi Password:       12345678
   Provision Gateway:    http://192.168.137.1:80
 ============================================================
 ```
 
 ### Step 2: Connect the TVIP Box
 1. Power on your TVIP box.
-2. On the TV screen, connect to the displayed Wi-Fi network.
+2. In the Wi-Fi settings on the TV screen, select **`TVIP-UNLOCK`**.
+3. Enter password: **`12345678`** (using the numeric keypad on your TV remote).
 
 ### Step 3: Done!
 As soon as the TVIP box connects:

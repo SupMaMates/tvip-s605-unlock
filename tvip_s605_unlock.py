@@ -245,6 +245,32 @@ Write-Output "KEY:$($config.Passphrase)"
 Write-Output "STATE:$($manager.TetheringOperationalState)"
 """
 
+PS_SET_HOTSPOT_CODE = """
+param (
+    [string]$Ssid = "TVIP-UNLOCK",
+    [string]$Password = "12345678"
+)
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+function AwaitAction($WinRtTask) {
+    $netTask = $asTaskGeneric.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+}
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -eq $profile) { Write-Output "STATUS:NoProfile"; exit 1 }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+$config = $manager.GetCurrentAccessPointConfiguration()
+$config.Ssid = $Ssid
+$config.Passphrase = $Password
+AwaitAction ($manager.ConfigureAccessPointAsync($config))
+$updated = $manager.GetCurrentAccessPointConfiguration()
+Write-Output "STATUS:Success"
+Write-Output "SSID:$($updated.Ssid)"
+Write-Output "KEY:$($updated.Passphrase)"
+"""
+
 PS_STOP_HOTSPOT_CODE = """
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
@@ -304,6 +330,24 @@ def start_windows_hotspot():
 def stop_windows_hotspot():
     out = execute_ps_script(PS_STOP_HOTSPOT_CODE, "stop_hotspot.ps1")
     return "STATUS:Success" in out or "STATUS:AlreadyOff" in out
+
+def configure_windows_hotspot(ssid="TVIP-UNLOCK", password="12345678"):
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "set_hotspot_config.ps1")
+    if not os.path.exists(script_path):
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(PS_SET_HOTSPOT_CODE.strip())
+        except Exception:
+            script_path = os.path.join(tempfile.gettempdir(), "set_hotspot_config.ps1")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(PS_SET_HOTSPOT_CODE.strip())
+
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path, "-Ssid", ssid, "-Password", password],
+        capture_output=True,
+        text=True
+    )
+    return "STATUS:Success" in res.stdout
 
 # =========================================================================
 # Hosts File DNS Redirect Management
@@ -490,6 +534,8 @@ def main():
     parser.add_argument("-s", "--device", help="ADB target device (e.g. 192.168.1.41:5555)")
     parser.add_argument("--box-ip", help="IP address of the TVIP box for network checks (e.g. 192.168.1.41)")
     parser.add_argument("--hotspot", action="store_true", help="1-Click Windows Mobile Hotspot Mode (Zero Router Config)")
+    parser.add_argument("--hotspot-ssid", default="TVIP-UNLOCK", help="Hotspot Wi-Fi network name (default: TVIP-UNLOCK)")
+    parser.add_argument("--hotspot-pass", default="12345678", help="Hotspot Wi-Fi password (default: 12345678 - minimum 8 chars for WPA2)")
     parser.add_argument("--stop-hotspot", action="store_true", help="Turn off Windows Mobile Hotspot and exit")
     parser.add_argument("--keep-hotspot", action="store_true", help="Do not turn off hotspot upon exit")
     parser.add_argument("--domains", default=",".join(DEFAULT_DOMAINS), help="Comma-separated domains to redirect to this PC")
@@ -563,6 +609,9 @@ def main():
             print("[!] Hotspot automation is designed for Windows 10/11.")
             print("    On Linux/macOS, use --serve with your router/dnsmasq redirect.")
             sys.exit(1)
+
+        print(f"[*] Setting Hotspot SSID to '{args.hotspot_ssid}' and Password to '{args.hotspot_pass}'...")
+        configure_windows_hotspot(args.hotspot_ssid, args.hotspot_pass)
 
         print("[*] ACTIVATING WINDOWS MOBILE HOTSPOT (1-Click Mode)...")
         hotspot_ok = start_windows_hotspot()
