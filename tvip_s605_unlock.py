@@ -198,6 +198,43 @@ def telnet_auto_burn(ip, user, password):
     except Exception:
         return False
 
+def ssh_auto_burn(ip, user, password):
+    """Burn NVRAM via SSH using paramiko (auto-installs if missing)."""
+    try:
+        import paramiko
+    except ImportError:
+        print(f"[*] Installing paramiko for SSH auto-burn...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "paramiko", "-q"],
+                           check=True, timeout=30)
+            import paramiko
+        except Exception as e:
+            print(f"[!] Could not install paramiko: {e}")
+            return False
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            ip, port=22, username=user, password=password,
+            timeout=10, allow_agent=False, look_for_keys=False,
+            banner_timeout=15
+        )
+        # Run all burn commands in one shell session
+        session = client.invoke_shell()
+        time.sleep(1.0)
+        session.recv(4096)  # flush banner
+        for cmd in BURN_COMMANDS:
+            session.send(f"{cmd}\n")
+            time.sleep(0.4)
+        time.sleep(1.0)
+        session.close()
+        client.close()
+        return True
+    except Exception as e:
+        print(f"[!] SSH burn error: {e}")
+        return False
+
 def read_unifykey_ps(device=None):
     cmd = ["shell", "echo 1 > /sys/class/unifykeys/attach && echo ps > /sys/class/unifykeys/name && cat /sys/class/unifykeys/read"]
     code, out, err = run_adb(cmd, device)
@@ -523,7 +560,7 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
         print(f"[*] Waiting 5 seconds for TVIP box ({client_ip}) to initialize root shell...")
         time.sleep(5)
 
-        # 1. Probing Telnet on port 23 (Linux-QT & Android default)
+        # 1. Try Telnet port 23
         print(f"[*] Probing Telnet on {client_ip}:23...")
         if check_port(client_ip, 23, timeout=3.0):
             print(f"[+] Telnet is OPEN! Logging into root shell and burning NVRAM...")
@@ -535,7 +572,21 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
                 print("============================================================\n")
                 return
 
-        # 2. Probing ADB on port 5555
+        # 2. Try SSH port 22 (Dropbear - Linux-QT default when telnet not active)
+        print(f"[*] Probing Dropbear SSH on {client_ip}:22...")
+        if check_port(client_ip, 22, timeout=3.0):
+            print(f"[+] SSH is OPEN! Connecting and burning NVRAM via SSH...")
+            if ssh_auto_burn(client_ip, "root", ProvisionHandler.configured_password):
+                print("\n============================================================")
+                print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED WITH 127.0.0.1!")
+                print("           The operator lock has been permanently erased.")
+                print("           The box is now rebooting fully unlocked.")
+                print("============================================================\n")
+                return
+            else:
+                print(f"[!] SSH burn failed. Trying ADB...")
+
+        # 3. Try ADB port 5555
         if check_port(client_ip, 5555, timeout=2.0):
             print(f"[*] ADB is OPEN on {client_ip}:5555. Burning NVRAM via ADB...")
             run_adb(["connect", f"{client_ip}:5555"])
@@ -548,8 +599,13 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             print("============================================================\n")
             return
 
-        print(f"[*] Dropbear SSH is listening on {client_ip}:22.")
-        print(f"    You can log in anytime: ssh root@{client_ip} (password: {ProvisionHandler.configured_password})")
+        print(f"\n[!] Auto-burn could not connect (Telnet/SSH/ADB all failed).")
+        print(f"    Manually run these commands on the box:")
+        print(f"    ssh root@{client_ip}  (password: {ProvisionHandler.configured_password})")
+        print(f"    Then paste:")
+        for cmd in BURN_COMMANDS:
+            print(f"      {cmd}")
+
 
     def log_message(self, format, *args):
         pass
