@@ -112,6 +112,28 @@ def is_admin():
     except Exception:
         return False
 
+def elevate_if_needed():
+    """On Windows, re-launch this script as Administrator via UAC if not already elevated."""
+    if sys.platform != "win32":
+        return
+    if is_admin():
+        return
+    # Re-launch with elevation request
+    print("[*] Administrator privileges required for DNS redirect (hosts file).")
+    print("[*] Requesting elevation via Windows UAC...")
+    try:
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1
+        )
+        if ret > 32:
+            # Successfully spawned elevated process - exit current non-elevated one
+            sys.exit(0)
+        else:
+            print("[!] UAC elevation was declined or failed.")
+    except Exception as e:
+        print(f"[!] Could not elevate: {e}")
+
 def run_adb(cmd_list, device=None):
     base = ["adb"]
     if device:
@@ -610,6 +632,9 @@ def main():
             print("    On Linux/macOS, use --serve with your router/dnsmasq redirect.")
             sys.exit(1)
 
+        # Require admin for hosts file DNS redirect - try UAC elevation automatically
+        elevate_if_needed()
+
         print(f"[*] Setting Hotspot SSID to '{args.hotspot_ssid}' and Password to '{args.hotspot_pass}'...")
         configure_windows_hotspot(args.hotspot_ssid, args.hotspot_pass)
 
@@ -625,19 +650,31 @@ def main():
         hotspot_ip = "192.168.137.1"
         redirect_domains = [d.strip() for d in args.domains.split(",") if d.strip()]
 
-        # Apply hosts DNS redirects
+        # Apply hosts DNS redirects (requires admin - we tried UAC above)
         admin_status = is_admin()
+        dns_ok = False
         if admin_status:
-            print(f"[*] Administrator detected: configuring local DNS redirects...")
+            print(f"[*] Configuring local DNS redirects in hosts file...")
             if apply_hosts_redirect(hotspot_ip, redirect_domains):
-                print(f"[+] Operator domains successfully redirected to {hotspot_ip} in hosts file:")
+                dns_ok = True
+                print(f"[+] Operator domains redirected to {hotspot_ip}:")
                 for d in redirect_domains:
                     print(f"    - {d} -> {hotspot_ip}")
-        else:
-            print(f"[*] Note: Running without Administrator privileges.")
-            print(f"    To auto-redirect operator domains, run this terminal as Administrator,")
-            print(f"    or add the following line to C:\\Windows\\System32\\drivers\\etc\\hosts:")
-            print(f"    {hotspot_ip} dreambox.for-better.biz\n")
+
+        if not dns_ok:
+            print("\n" + "!" * 60)
+            print("  WARNING: DNS REDIRECT NOT APPLIED!")
+            print("!" * 60)
+            print(f"  The TVIP box will still contact the real operator server.")
+            print(f"  To fix this, add this line to your hosts file:")
+            print(f"  {HOSTS_PATH}")
+            print(f"")
+            for d in redirect_domains:
+                print(f"    {hotspot_ip:<16} {d}")
+            print("")
+            print("  OR re-run this script as Administrator (right-click -> Run as Admin)")
+            print("!" * 60 + "\n")
+            input("Press ENTER to continue anyway (DNS redirect will not work) or Ctrl+C to quit...")
 
         print("\n" + "=" * 60)
         print("          WINDOWS MOBILE HOTSPOT IS READY!")
@@ -645,6 +682,10 @@ def main():
         print(f"  Wi-Fi Network (SSID): {info['ssid']}")
         print(f"  Wi-Fi Password:       {info['key']}")
         print(f"  Provision Gateway:    http://{hotspot_ip}:{args.port}")
+        if dns_ok:
+            print(f"  DNS Redirect:         ACTIVE (hosts file patched)")
+        else:
+            print(f"  DNS Redirect:         !! NOT ACTIVE - see warning above !!")
         print("=" * 60)
         print("\n>>> WHAT TO DO NOW:")
         print(f"1. Power on your TVIP box.")
