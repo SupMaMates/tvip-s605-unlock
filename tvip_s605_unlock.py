@@ -56,6 +56,7 @@ PROVISION_TEMPLATE = """<?xml version="1.0"?>
   <!-- Make all TV preferences, content sources, and setup buttons visible -->
   <preferences>
     <pref_tv>
+{custom_stalker_prefs}
       <pref_tv_streamtype visible="true" />
       <pref_tv_udpxyaddress visible="true" />
       <pref_tv_dvr_deviceid visible="true" />
@@ -678,14 +679,33 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+def format_stalker_url(url):
+    u = url.strip()
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "http://" + u
+    if not u.endswith("/"):
+        u += "/"
+    return u
+
 def start_provision_server(port, password, portal_url=None):
     custom_proto = ""
+    custom_stalker_prefs = ""
     if portal_url:
-        custom_proto = f"""  <tv_protocols default="browser">
-    <protocol type="browser" server="{portal_url}" api="mag" noui="false" combined="true" />
+        formatted_url = format_stalker_url(portal_url)
+        # Native Stalker / MAG Middleware Protocol (Android 8.0 & Linux-QT)
+        custom_proto = f"""  <!-- Native Stalker / MAG Middleware Protocol -->
+  <tv_protocols force="true" default="stalker">
+    <protocol type="stalker" url="{formatted_url}" server="{formatted_url}" />
   </tv_protocols>"""
+        custom_stalker_prefs = f"""      <stalker_server value="{formatted_url}" />
+      <pref_tv_middleware value="stalker" visible="true" />
+      <pref_tv_button_midd_setup visible="true" />"""
 
-    xml = PROVISION_TEMPLATE.format(password=password, custom_protocol=custom_proto).encode("utf-8")
+    xml = PROVISION_TEMPLATE.format(
+        password=password,
+        custom_protocol=custom_proto,
+        custom_stalker_prefs=custom_stalker_prefs
+    ).encode("utf-8")
     ProvisionHandler.xml_content = xml
     ProvisionHandler.configured_password = password
 
@@ -693,6 +713,40 @@ def start_provision_server(port, password, portal_url=None):
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     return server
+
+def print_device_macs(target_dev):
+    print("\n--- Device MAC Addresses (Stalker / MAG Subscription Binding) ---")
+    eth_mac = "Not detected"
+    wlan_mac = "Not detected"
+    if target_dev:
+        _, out, _ = run_adb(["shell", "cat /sys/class/net/eth0/address 2>/dev/null"], target_dev)
+        if out and ":" in out:
+            eth_mac = out.strip().upper()
+        _, out, _ = run_adb(["shell", "cat /sys/class/net/wlan0/address 2>/dev/null"], target_dev)
+        if out and ":" in out:
+            wlan_mac = out.strip().upper()
+    print(f"  Ethernet MAC (eth0):  {eth_mac}")
+    print(f"  Wi-Fi MAC (wlan0):     {wlan_mac}")
+    print("\n  Provide the active MAC address above to your IPTV provider so they can activate your line.")
+
+def monitor_stalker_logs(target_dev):
+    if not target_dev:
+        print("[!] No ADB device connected. Connect device via ADB first.")
+        return
+    print(f"\n[*] Monitoring Stalker handshake logs on {target_dev} (Press Ctrl+C to stop)...")
+    try:
+        subprocess.run(["adb", "-s", target_dev, "logcat", "-c"])
+        p = subprocess.Popen(
+            ["adb", "-s", target_dev, "logcat", "-v", "time"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        for line in p.stdout:
+            if any(k in line.lower() for k in ["stalker", "load.php", "js api version", "getprofile", "makeRPCRequest".lower()]):
+                print(line.strip())
+    except KeyboardInterrupt:
+        print("\n[*] Stopped monitoring.")
 
 def run_diagnostics(target_dev, box_ip):
     print("\n--- Diagnostic Results ---")
@@ -740,26 +794,44 @@ def main():
     parser.add_argument("--serve", action="store_true", help="Start provisioning server with Auto-Burner enabled")
     parser.add_argument("--port", type=int, default=80, help="HTTP server port (default: 80)")
     parser.add_argument("--password", default="toor", help="Password for SSH/Telnet root shell (default: toor)")
-    parser.add_argument("--portal", help="Optional custom portal URL to inject (e.g. http://my-stalker-portal.com)")
+    parser.add_argument("--portal", help="Custom Stalker / MAG portal URL (e.g. http://my-portal.com/c/)")
+    parser.add_argument("--stalker", help="Alias for --portal (e.g. http://my-portal.com/c/)")
+    parser.add_argument("--mag", help="Alias for --portal (e.g. http://my-portal.com/c/)")
+    parser.add_argument("--get-mac", action="store_true", help="Display device MAC addresses for Stalker subscription binding")
+    parser.add_argument("--monitor-stalker", action="store_true", help="Monitor real-time Stalker handshake logs via ADB logcat")
     parser.add_argument("--check", action="store_true", help="Run read-only diagnostics")
     parser.add_argument("--reboot", action="store_true", help="Reboot device via ADB")
     args = parser.parse_args()
 
     print(BANNER)
 
-    # 1. Quick utility to stop hotspot
+    devices = get_adb_devices()
+    target_dev = args.device or (devices[0] if devices else None)
+    box_ip = args.box_ip
+    if not box_ip and target_dev and ":" in target_dev:
+        box_ip = target_dev.split(":")[0]
+
+    portal_url = args.stalker or args.mag or args.portal
+    if portal_url:
+        portal_url = format_stalker_url(portal_url)
+
+    # Helper command: print MAC addresses for provider registration
+    if args.get_mac:
+        print_device_macs(target_dev)
+        sys.exit(0)
+
+    # Helper command: monitor Stalker handshake logs
+    if args.monitor_stalker:
+        monitor_stalker_logs(target_dev)
+        sys.exit(0)
+
+    # Quick utility to stop hotspot
     if args.stop_hotspot:
         print("[*] Turning off Windows Mobile Hotspot...")
         stop_windows_hotspot()
         remove_hosts_redirect()
         print("[+] Hotspot disabled and hosts redirects removed.")
         sys.exit(0)
-
-    devices = get_adb_devices()
-    target_dev = args.device or (devices[0] if devices else None)
-    box_ip = args.box_ip
-    if not box_ip and target_dev and ":" in target_dev:
-        box_ip = target_dev.split(":")[0]
 
     # If no flags passed, default to check + unlock
     if not any([args.hotspot, args.unlock, args.serve, args.check, args.reboot]):
@@ -860,6 +932,8 @@ def main():
             print(f"  DNS Redirect:         ACTIVE (hosts file patched)")
         else:
             print(f"  DNS Redirect:         !! NOT ACTIVE - see warning above !!")
+        if portal_url:
+            print(f"  Stalker Portal:       {portal_url}")
         print("=" * 60)
         print("\n>>> WHAT TO DO NOW:")
         print(f"1. Power on your TVIP box.")
@@ -872,7 +946,7 @@ def main():
         print("=" * 60 + "\n")
 
         try:
-            server = start_provision_server(args.port, args.password, args.portal)
+            server = start_provision_server(args.port, args.password, portal_url)
             print(f"[+] HTTP Server active on port {args.port}. Waiting for TVIP box...\n")
             while True:
                 time.sleep(1)
@@ -894,11 +968,11 @@ def main():
         print(f"\n[*] Starting Provisioning Server on http://{local_ip}:{args.port}/prov/tvip_provision.xml")
         print(f"[*] Zero-Touch Auto-Burner: ENABLED")
         print(f"[*] Configured root shell password: '{args.password}'")
-        if args.portal:
-            print(f"[*] Custom portal URL: '{args.portal}'")
+        if portal_url:
+            print(f"[*] Stalker / MAG Middleware Portal: '{portal_url}'")
 
         try:
-            server = start_provision_server(args.port, args.password, args.portal)
+            server = start_provision_server(args.port, args.password, portal_url)
             print("\n[+] HTTP Server is LIVE. Waiting for TVIP box to connect...")
             print("    (When the box connects, the script will automatically burn 127.0.0.1 and reboot it!)\n")
 

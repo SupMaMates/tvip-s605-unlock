@@ -113,21 +113,71 @@ reboot
 
 ---
 
-## 4. Configuring Your Custom IPTV / Stalker / MAG Portal
+## 4. Configuring Custom MAG / Stalker Middleware
 
-Once unlocked, the TVIP box runs in unrestricted factory mode:
-1. From the TVIP home screen, navigate to **Settings -> TV**.
-2. Under **Content source**, select your desired mode:
-   * **IPTV-portal:** Enter Login, Password, and Server URL.
-   * **Middleware API:** Enter TVIP JSON API server URL.
-   * **M3U-playlist:** Enter custom M3U playlist and XMLTV EPG URL.
-   * **Android app:** Launch external players (TiviMate, OTT Navigator, etc.).
-3. Click **Setup [source]** to save your credentials.
+On Android 8.0 Oreo (build 20221028), TVIP does **not** use an HTML/Web browser or WebView for Stalker portals. Instead, TVIP includes a native C++ client (`15StalkerProtocol`) that connects directly to the portal's REST API endpoint (`/server/load.php`) and renders channels, EPG, and player UI via native hardware-accelerated OpenGL ES.
 
-Optional: You can also pre-inject your portal directly into the provisioning feed:
+### A. Step 1: Get Your Device MAC Address
+Stalker / Ministra portals authenticate subscriptions by MAC address:
 ```bash
-python tvip_s605_unlock.py --hotspot --portal "http://your-stalker-portal.com"
+# Query MAC addresses directly via the suite:
+python tvip_s605_unlock.py --get-mac
 ```
+Output:
+```text
+  Ethernet MAC (eth0):  10:27:BE:24:09:6E
+  Wi-Fi MAC (wlan0):     A0:67:20:6C:8E:4C
+```
+Provide the active MAC address (Ethernet or Wi-Fi, depending on how your box connects) to your IPTV provider to activate your subscription line.
+
+### B. Step 2: Configure the Stalker Portal
+
+#### Option 1: Automatic Injection via Provisioning Feed (`--stalker` / `--mag`)
+You can pre-configure your Stalker portal when launching `--hotspot` or `--serve`:
+```bash
+python tvip_s605_unlock.py --hotspot --stalker "http://YOUR_PORTAL_HOST/c/"
+```
+The suite automatically builds the native Stalker XML:
+```xml
+<tv_protocols force="true" default="stalker">
+  <protocol type="stalker" url="http://YOUR_PORTAL_HOST/c/" server="http://YOUR_PORTAL_HOST/c/" />
+</tv_protocols>
+<preferences>
+  <pref_tv>
+    <stalker_server value="http://YOUR_PORTAL_HOST/c/" />
+    <pref_tv_middleware value="stalker" visible="true" />
+    <pref_tv_button_midd_setup visible="true" />
+  </pref_tv>
+</preferences>
+```
+
+#### Option 2: Configure via TV Remote Control (On-Screen UI)
+1. In the TVIP main screen, go to **Settings** (gear icon) -> **TV**.
+2. Set **Content source** to **Stalker** (or *Stalker middleware*).
+3. Click the button directly underneath: **Setup Stalker Middleware**.
+4. In the dialog, set:
+   * **Portal URL:** `http://YOUR_PORTAL_HOST/c/` (or `http://YOUR_PORTAL_HOST/stalker_portal/c/`)
+5. Click **Apply**.
+6. Return to the home screen and click **Watch TV**.
+
+### C. Step 3: Monitor Connection Handshake (Optional)
+To verify the native Stalker handshake in real time:
+```bash
+python tvip_s605_unlock.py --monitor-stalker
+```
+Expected log flow on successful connection:
+1. `Adding "http://" to portal address...`
+2. `JS API version: 331; STB API version: 141; Player Engine version: 0x572`
+3. `Constructor. Portal url: http://YOUR_PORTAL_HOST/c/`
+4. `GET /server/load.php?type=stb&action=handshake`
+5. `GET /server/load.php?type=stb&action=get_profile`
+6. `GET /server/load.php?type=itv&action=get_genres`
+7. `GET /server/load.php?type=itv&action=get_ordered_list`
+
+### Troubleshooting Stalker Portals
+* **"LoadProfile: STB is blocked OR 'enable_mac_format_validation' is enabled on server"**: Provider has not registered your MAC address in their panel, or the subscription has expired. Confirm the exact MAC address from `--get-mac` with your provider.
+* **"Stalker portal URL is empty. Can't run protocol"**: Ensure the URL is entered and ends with `/c/`.
+* **"Protocol was not created!"**: The protocol type was set to "browser" instead of "stalker". TVIP on Android does not have a browser protocol; use native `stalker`.
 
 ---
 
@@ -150,21 +200,24 @@ adb shell pm clear tv.tvip.app
 
 ```text
 usage: tvip_s605_unlock.py [-h] [-s DEVICE] [--box-ip BOX_IP] [--hotspot]
-                           [--stop-hotspot] [--keep-hotspot]
-                           [--domains DOMAINS] [--unlock]
+                           [--hotspot-ssid HOTSPOT_SSID]
+                           [--hotspot-pass HOTSPOT_PASS] [--stop-hotspot]
+                           [--keep-hotspot] [--domains DOMAINS] [--unlock]
                            [--server-ip SERVER_IP] [--serve] [--port PORT]
-                           [--password PASSWORD] [--portal PORTAL] [--check]
-                           [--reboot]
+                           [--password PASSWORD] [--portal PORTAL]
+                           [--stalker STALKER] [--mag MAG] [--get-mac]
+                           [--monitor-stalker] [--check] [--reboot]
 
 options:
   --hotspot             1-Click Windows Mobile Hotspot Mode (Zero Router Config)
+  --hotspot-ssid        Custom SSID for hotspot (default: TVIP-UNLOCK)
+  --hotspot-pass        Custom password for hotspot (default: 12345678)
   --stop-hotspot        Turn off Windows Mobile Hotspot and exit
-  --keep-hotspot        Do not turn off hotspot upon exit
-  --domains DOMAINS     Comma-separated domains to redirect (default: dreambox.for-better.biz,...)
   --serve               Start provisioning server with Auto-Burner enabled
   --unlock              Perform permanent hardware unlock via NVRAM UnifyKeys
-  --password PASSWORD   Password for SSH/Telnet root shell (default: toor)
-  --portal PORTAL       Optional custom portal URL to inject
+  --stalker, --mag      Inject custom Stalker / MAG portal (e.g. http://my-portal/c/)
+  --get-mac             Display Ethernet and Wi-Fi MAC addresses for line activation
+  --monitor-stalker     Tail real-time Stalker handshake logs via ADB logcat
   --check               Run read-only diagnostics
   --reboot              Reboot device via ADB
 ```
