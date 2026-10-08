@@ -4,19 +4,28 @@ TVIP S-Box 605 -- All-in-One Hardware Unlocker & Root Provisioning Suite
 Supports both Android 8.0 and Linux-QT firmware variants.
 
 Features:
-  1. Automated Hardware Unlock: Reprograms Amlogic NVRAM UnifyKeys directly via ADB.
-  2. Zero-Touch Auto-Burner: When running provision server, automatically connects to
-     the TVIP box upon boot, logs in, burns 127.0.0.1 to chip NVRAM, and reboots.
-  3. Network Diagnostics: Probes ADB, SSH (22), and Telnet (23).
+  1. 1-Click Windows Mobile Hotspot Mode (--hotspot): Automatically enables
+     PC Wi-Fi hotspot, extracts SSID/password, redirects operator domains,
+     and auto-provisions/burns the TVIP box with zero router configuration.
+  2. Zero-Touch Auto-Burner: When running provision server, automatically connects
+     to the TVIP box upon boot, logs into root shell, permanently burns 127.0.0.1
+     into Amlogic NVRAM UnifyKeys, and reboots.
+  3. Automated Hardware Unlock (--unlock): Reprograms Amlogic NVRAM UnifyKeys
+     directly via ADB.
+  4. Network Diagnostics (--check): Probes ADB, Dropbear SSH (22), and Telnet (23).
 """
 
 import argparse
+import atexit
+import ctypes
 import http.server
 import os
+import signal
 import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -76,6 +85,32 @@ BURN_COMMANDS = [
     "sync",
     "reboot"
 ]
+
+DEFAULT_DOMAINS = [
+    "dreambox.for-better.biz",
+    "tvipstb.net",
+    "update.tvip.ru",
+    "prov.tvip.ru"
+]
+
+HOSTS_PATH = os.path.expandvars(r"%SystemRoot%\System32\drivers\etc\hosts") if sys.platform == "win32" else "/etc/hosts"
+HOSTS_TAG_START = "# >>> TVIP-S605-UNLOCK REDIRECT >>>"
+HOSTS_TAG_END   = "# <<< TVIP-S605-UNLOCK REDIRECT <<<"
+
+_hosts_modified = False
+_hotspot_started_by_us = False
+
+# =========================================================================
+# System & ADB Helpers
+# =========================================================================
+
+def is_admin():
+    if sys.platform != "win32":
+        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
 
 def run_adb(cmd_list, device=None):
     base = ["adb"]
@@ -138,7 +173,7 @@ def telnet_auto_burn(ip, user, password):
             time.sleep(0.3)
         s.close()
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 def read_unifykey_ps(device=None):
@@ -172,6 +207,166 @@ def check_device_info(device=None):
     props["selinux"] = se
     return props
 
+# =========================================================================
+# Windows Mobile Hotspot Automation (WinRT API via PowerShell)
+# =========================================================================
+
+PS_START_HOTSPOT_CODE = """
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -eq $profile) { Write-Output "STATUS:NoProfile"; exit 1 }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+if ($manager.TetheringOperationalState -eq "Off") {
+    $res = Await ($manager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    Write-Output "STATUS:$($res.Status)"
+} else {
+    Write-Output "STATUS:AlreadyOn"
+}
+"""
+
+PS_INFO_HOTSPOT_CODE = """
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -eq $profile) { Write-Output "STATUS:NoProfile"; exit 1 }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+$config = $manager.GetCurrentAccessPointConfiguration()
+Write-Output "SSID:$($config.Ssid)"
+Write-Output "KEY:$($config.Passphrase)"
+Write-Output "STATE:$($manager.TetheringOperationalState)"
+"""
+
+PS_STOP_HOTSPOT_CODE = """
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -eq $profile) { Write-Output "STATUS:NoProfile"; exit 1 }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+if ($manager.TetheringOperationalState -ne "Off") {
+    $res = Await ($manager.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    Write-Output "STATUS:$($res.Status)"
+} else {
+    Write-Output "STATUS:AlreadyOff"
+}
+"""
+
+def execute_ps_script(script_text, fallback_filename):
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fallback_filename)
+    if not os.path.exists(script_path):
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script_text.strip())
+        except Exception:
+            script_path = os.path.join(tempfile.gettempdir(), fallback_filename)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script_text.strip())
+
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
+        capture_output=True,
+        text=True
+    )
+    return res.stdout.strip()
+
+def get_hotspot_info():
+    out = execute_ps_script(PS_INFO_HOTSPOT_CODE, "get_hotspot_info.ps1")
+    info = {"ssid": "Unknown", "key": "Unknown", "state": "Unknown"}
+    for line in out.splitlines():
+        if line.startswith("SSID:"):
+            info["ssid"] = line.split("SSID:", 1)[1].strip()
+        elif line.startswith("KEY:"):
+            info["key"] = line.split("KEY:", 1)[1].strip()
+        elif line.startswith("STATE:"):
+            info["state"] = line.split("STATE:", 1)[1].strip()
+    return info
+
+def start_windows_hotspot():
+    out = execute_ps_script(PS_START_HOTSPOT_CODE, "start_hotspot.ps1")
+    return "STATUS:Success" in out or "STATUS:AlreadyOn" in out
+
+def stop_windows_hotspot():
+    out = execute_ps_script(PS_STOP_HOTSPOT_CODE, "stop_hotspot.ps1")
+    return "STATUS:Success" in out or "STATUS:AlreadyOff" in out
+
+# =========================================================================
+# Hosts File DNS Redirect Management
+# =========================================================================
+
+def apply_hosts_redirect(redirect_ip, domains):
+    global _hosts_modified
+    if not is_admin():
+        return False
+    try:
+        content = ""
+        if os.path.exists(HOSTS_PATH):
+            with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+        if HOSTS_TAG_START in content:
+            remove_hosts_redirect()
+            with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+        lines = [f"\n{HOSTS_TAG_START}"]
+        for d in domains:
+            lines.append(f"{redirect_ip:<16} {d}")
+        lines.append(f"{HOSTS_TAG_END}\n")
+
+        with open(HOSTS_PATH, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        _hosts_modified = True
+        return True
+    except Exception as e:
+        print(f"[!] Warning: Could not modify hosts file automatically: {e}")
+        return False
+
+def remove_hosts_redirect():
+    global _hosts_modified
+    if not os.path.exists(HOSTS_PATH):
+        return
+    try:
+        with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if HOSTS_TAG_START in content and HOSTS_TAG_END in content:
+            start_idx = content.find(HOSTS_TAG_START)
+            end_idx = content.find(HOSTS_TAG_END) + len(HOSTS_TAG_END)
+            new_content = content[:start_idx].rstrip() + "\n" + content[end_idx:].lstrip()
+            with open(HOSTS_PATH, "w", encoding="utf-8") as f:
+                f.write(new_content)
+        _hosts_modified = False
+    except Exception:
+        pass
+
+@atexit.register
+def cleanup_on_exit():
+    global _hosts_modified, _hotspot_started_by_us
+    if _hosts_modified:
+        remove_hosts_redirect()
+    if _hotspot_started_by_us:
+        stop_windows_hotspot()
+
+# =========================================================================
+# Provision Server & Zero-Touch Auto-Burner
+# =========================================================================
+
 class ProvisionHandler(http.server.BaseHTTPRequestHandler):
     xml_content = b""
     configured_password = "toor"
@@ -182,16 +377,24 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         print(f"\n[HTTP GET] TVIP box ({client_ip}) requested: {self.path}")
 
-        if path.endswith("tvip_provision.xml") or path in ("/prov", "/prov/"):
+        # Match any provision request
+        is_prov = (
+            path.endswith("tvip_provision.xml") or
+            "provision" in path.lower() or
+            path.startswith("/prov") or
+            path.endswith(".xml") or
+            path in ("/", "")
+        )
+
+        if is_prov:
             self.send_response(200)
             self.send_header("Content-Type", "text/xml")
             self.send_header("Content-Length", str(len(self.xml_content)))
             self.end_headers()
             self.wfile.write(self.xml_content)
             print(f"[+] Delivered custom tvip_provision.xml to {client_ip}!")
-            print("[+] Root shell and unlocked preferences activated on box!")
+            print("[+] Root shell and unlocked UI preferences activated on box!")
 
-            # Trigger automated background burn if not already executed
             if not ProvisionHandler.burn_attempted:
                 ProvisionHandler.burn_attempted = True
                 threading.Thread(target=self.trigger_background_burn, args=(client_ip,), daemon=True).start()
@@ -200,14 +403,14 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def trigger_background_burn(self, client_ip):
-        print("\n[*] AUTO-BURNER ACTIVATED:")
-        print(f"[*] Waiting 6 seconds for TVIP box ({client_ip}) to initialize root shell...")
-        time.sleep(6)
+        print("\n[*] ZERO-TOUCH AUTO-BURNER ACTIVATED:")
+        print(f"[*] Waiting 5 seconds for TVIP box ({client_ip}) to initialize root shell...")
+        time.sleep(5)
 
-        # 1. Try Telnet auto-burn
+        # 1. Probing Telnet on port 23 (Linux-QT & Android default)
         print(f"[*] Probing Telnet on {client_ip}:23...")
         if check_port(client_ip, 23, timeout=3.0):
-            print(f"[+] Telnet is OPEN. Logging in as root and burning NVRAM...")
+            print(f"[+] Telnet is OPEN! Logging into root shell and burning NVRAM...")
             if telnet_auto_burn(client_ip, "root", ProvisionHandler.configured_password):
                 print("\n============================================================")
                 print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED WITH 127.0.0.1!")
@@ -216,18 +419,21 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
                 print("============================================================\n")
                 return
 
-        # 2. Try ADB if available
+        # 2. Probing ADB on port 5555
         if check_port(client_ip, 5555, timeout=2.0):
-            print(f"[*] ADB available on {client_ip}. Burning NVRAM via ADB...")
+            print(f"[*] ADB is OPEN on {client_ip}:5555. Burning NVRAM via ADB...")
             run_adb(["connect", f"{client_ip}:5555"])
             write_unifykey_ps("127.0.0.1", f"{client_ip}:5555")
             clear_tvip_data(f"{client_ip}:5555")
             run_adb(["reboot"], f"{client_ip}:5555")
-            print("[SUCCESS] Permanently burned via ADB!")
+            print("\n============================================================")
+            print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED VIA ADB!")
+            print("           The box is now rebooting fully unlocked.")
+            print("============================================================\n")
             return
 
         print(f"[*] Dropbear SSH is listening on {client_ip}:22.")
-        print(f"    You can connect anytime via: ssh root@{client_ip} (password: {ProvisionHandler.configured_password})")
+        print(f"    You can log in anytime: ssh root@{client_ip} (password: {ProvisionHandler.configured_password})")
 
     def log_message(self, format, *args):
         pass
@@ -274,10 +480,19 @@ def run_diagnostics(target_dev, box_ip):
         print(f"    Port 23 (Telnet):       {'OPEN [Root Shell Available]' if telnet_ok else 'Closed'}")
         print(f"    Port 5555 (ADB):        {'OPEN' if adb_ok else 'Closed'}")
 
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
 def main():
+    global _hotspot_started_by_us
     parser = argparse.ArgumentParser(description="TVIP S-Box 605 All-in-One Unlocker & Auto-Burn Suite")
     parser.add_argument("-s", "--device", help="ADB target device (e.g. 192.168.1.41:5555)")
     parser.add_argument("--box-ip", help="IP address of the TVIP box for network checks (e.g. 192.168.1.41)")
+    parser.add_argument("--hotspot", action="store_true", help="1-Click Windows Mobile Hotspot Mode (Zero Router Config)")
+    parser.add_argument("--stop-hotspot", action="store_true", help="Turn off Windows Mobile Hotspot and exit")
+    parser.add_argument("--keep-hotspot", action="store_true", help="Do not turn off hotspot upon exit")
+    parser.add_argument("--domains", default=",".join(DEFAULT_DOMAINS), help="Comma-separated domains to redirect to this PC")
     parser.add_argument("--unlock", action="store_true", help="Perform permanent hardware unlock via NVRAM UnifyKeys")
     parser.add_argument("--server-ip", default="127.0.0.1", help="Target server to write to NVRAM (default: 127.0.0.1)")
     parser.add_argument("--serve", action="store_true", help="Start provisioning server with Auto-Burner enabled")
@@ -290,6 +505,14 @@ def main():
 
     print(BANNER)
 
+    # 1. Quick utility to stop hotspot
+    if args.stop_hotspot:
+        print("[*] Turning off Windows Mobile Hotspot...")
+        stop_windows_hotspot()
+        remove_hosts_redirect()
+        print("[+] Hotspot disabled and hosts redirects removed.")
+        sys.exit(0)
+
     devices = get_adb_devices()
     target_dev = args.device or (devices[0] if devices else None)
     box_ip = args.box_ip
@@ -297,7 +520,7 @@ def main():
         box_ip = target_dev.split(":")[0]
 
     # If no flags passed, default to check + unlock
-    if not any([args.unlock, args.serve, args.check, args.reboot]):
+    if not any([args.hotspot, args.unlock, args.serve, args.check, args.reboot]):
         print("[*] No flags specified. Running diagnostics and hardware unlock...")
         args.check = True
         args.unlock = True
@@ -334,7 +557,75 @@ def main():
         print("\n[+] HARDWARE UNLOCK APPLIED SUCCESSFULLY!")
         print("    The provider lock has been neutralized.")
 
-    if args.serve:
+    # 2. Hotspot Mode Flow
+    if args.hotspot:
+        if sys.platform != "win32":
+            print("[!] Hotspot automation is designed for Windows 10/11.")
+            print("    On Linux/macOS, use --serve with your router/dnsmasq redirect.")
+            sys.exit(1)
+
+        print("[*] ACTIVATING WINDOWS MOBILE HOTSPOT (1-Click Mode)...")
+        hotspot_ok = start_windows_hotspot()
+        if not hotspot_ok:
+            print("[!] Warning: Could not automatically activate Hotspot via WinRT.")
+            print("    Please toggle 'Mobile Hotspot' ON in Windows Settings.")
+        else:
+            _hotspot_started_by_us = not args.keep_hotspot
+
+        info = get_hotspot_info()
+        hotspot_ip = "192.168.137.1"
+        redirect_domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+
+        # Apply hosts DNS redirects
+        admin_status = is_admin()
+        if admin_status:
+            print(f"[*] Administrator detected: configuring local DNS redirects...")
+            if apply_hosts_redirect(hotspot_ip, redirect_domains):
+                print(f"[+] Operator domains successfully redirected to {hotspot_ip} in hosts file:")
+                for d in redirect_domains:
+                    print(f"    - {d} -> {hotspot_ip}")
+        else:
+            print(f"[*] Note: Running without Administrator privileges.")
+            print(f"    To auto-redirect operator domains, run this terminal as Administrator,")
+            print(f"    or add the following line to C:\\Windows\\System32\\drivers\\etc\\hosts:")
+            print(f"    {hotspot_ip} dreambox.for-better.biz\n")
+
+        print("\n" + "=" * 60)
+        print("          WINDOWS MOBILE HOTSPOT IS READY!")
+        print("=" * 60)
+        print(f"  Wi-Fi Network (SSID): {info['ssid']}")
+        print(f"  Wi-Fi Password:       {info['key']}")
+        print(f"  Provision Gateway:    http://{hotspot_ip}:{args.port}")
+        print("=" * 60)
+        print("\n>>> WHAT TO DO NOW:")
+        print(f"1. Power on your TVIP box.")
+        print(f"2. Connect the TVIP box to Wi-Fi: \"{info['ssid']}\" (Password: {info['key']}).")
+        print(f"3. Sit back and watch! The script will automatically:")
+        print(f"   * Feed the unlock provisioning XML")
+        print(f"   * Log into root shell via Telnet / SSH")
+        print(f"   * Burn 127.0.0.1 permanently into the hardware chip")
+        print(f"   * Reboot the box completely unlocked!")
+        print("=" * 60 + "\n")
+
+        try:
+            server = start_provision_server(args.port, args.password, args.portal)
+            print(f"[+] HTTP Server active on port {args.port}. Waiting for TVIP box...\n")
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[*] Exiting Hotspot Mode...")
+        except PermissionError:
+            print(f"\n[!] Error: Port {args.port} requires administrator privileges.")
+            print("    Please run Command Prompt / Terminal as Administrator.")
+        finally:
+            remove_hosts_redirect()
+            if _hotspot_started_by_us:
+                print("[*] Turning off Windows Mobile Hotspot...")
+                stop_windows_hotspot()
+                print("[+] Cleanup complete.")
+
+    # 3. Standard Server Mode Flow
+    elif args.serve:
         local_ip = get_local_ip(box_ip or "192.168.1.1")
         print(f"\n[*] Starting Provisioning Server on http://{local_ip}:{args.port}/prov/tvip_provision.xml")
         print(f"[*] Zero-Touch Auto-Burner: ENABLED")
@@ -344,7 +635,7 @@ def main():
 
         try:
             server = start_provision_server(args.port, args.password, args.portal)
-            print("\n[+] HTTP Server is LIVE. Waiting for TVIP box to boot and connect...")
+            print("\n[+] HTTP Server is LIVE. Waiting for TVIP box to connect...")
             print("    (When the box connects, the script will automatically burn 127.0.0.1 and reboot it!)\n")
 
             if target_dev:
