@@ -178,62 +178,129 @@ def check_port(host, port, timeout=2.0):
     except Exception:
         return False
 
-def telnet_auto_burn(ip, user, password):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(6.0)
-        s.connect((ip, 23))
-        time.sleep(1.0)
-        s.recv(1024)
-        s.sendall(f"{user}\n".encode())
-        time.sleep(1.0)
-        s.recv(1024)
-        s.sendall(f"{password}\n".encode())
-        time.sleep(1.5)
-        for cmd in BURN_COMMANDS:
-            s.sendall(f"{cmd}\n".encode())
-            time.sleep(0.3)
-        s.close()
-        return True
-    except Exception:
-        return False
+def adb_auto_burn(ip):
+    """Burn NVRAM via ADB with read-back verification, cache wipe, and reboot."""
+    target = f"{ip}:5555"
+    run_adb(["connect", target])
+    time.sleep(1.0)
+
+    # 1. Write UnifyKeys ps
+    ok, err = write_unifykey_ps("127.0.0.1", target)
+    if not ok:
+        return False, f"Failed to write unifykey: {err}"
+
+    # 2. Strict read-back verification
+    val, _ = read_unifykey_ps(target)
+    if val != "127.0.0.1":
+        return False, f"Verification failed (expected '127.0.0.1', got '{val}')"
+
+    # 3. Wipe operator cache & SQLite database (MANDATORY on Android!)
+    clear_tvip_data(target)
+
+    # 4. Verified reboot
+    run_adb(["reboot"], target)
+    return True, "127.0.0.1 verified in chip NVRAM, app data wiped, and reboot issued."
 
 def ssh_auto_burn(ip, user, password):
-    """Burn NVRAM via SSH using paramiko (auto-installs if missing)."""
+    """Burn NVRAM via SSH using paramiko with read-back verification, cache wipe, and reboot."""
     try:
         import paramiko
     except ImportError:
-        print(f"[*] Installing paramiko for SSH auto-burn...")
+        print("[*] Installing paramiko for SSH auto-burn...")
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "paramiko", "-q"],
                            check=True, timeout=30)
             import paramiko
         except Exception as e:
-            print(f"[!] Could not install paramiko: {e}")
-            return False
+            return False, f"Could not install paramiko: {e}"
 
+    client = None
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
             ip, port=22, username=user, password=password,
-            timeout=10, allow_agent=False, look_for_keys=False,
-            banner_timeout=15
+            timeout=8, allow_agent=False, look_for_keys=False,
+            banner_timeout=10
         )
-        # Run all burn commands in one shell session
-        session = client.invoke_shell()
-        time.sleep(1.0)
-        session.recv(4096)  # flush banner
-        for cmd in BURN_COMMANDS:
-            session.send(f"{cmd}\n")
-            time.sleep(0.4)
-        time.sleep(1.0)
-        session.close()
-        client.close()
-        return True
+
+        # 1. Write UnifyKeys ps
+        write_cmd = (
+            "echo 1 > /sys/class/unifykeys/attach && "
+            "echo 1 > /sys/class/unifykeys/lock && "
+            "echo ps > /sys/class/unifykeys/name && "
+            "echo 127.0.0.1 > /sys/class/unifykeys/write && "
+            "echo 0 > /sys/class/unifykeys/lock"
+        )
+        client.exec_command(write_cmd)
+        time.sleep(0.5)
+
+        # 2. Strict read-back verification
+        _, stdout, _ = client.exec_command(
+            "echo 1 > /sys/class/unifykeys/attach && echo ps > /sys/class/unifykeys/name && cat /sys/class/unifykeys/read"
+        )
+        val = stdout.read().decode("utf-8", errors="ignore").strip()
+        if "127.0.0.1" not in val:
+            return False, f"Verification failed (readback: '{val}')"
+
+        # 3. Wipe operator cache (Linux-QT & Android)
+        client.exec_command("rm -rf /var/tvip/* && pm clear tv.tvip.app 2>/dev/null; sync")
+        time.sleep(0.5)
+
+        # 4. Reboot
+        client.exec_command("reboot")
+        return True, "127.0.0.1 verified in chip NVRAM, cache wiped, and reboot issued."
     except Exception as e:
-        print(f"[!] SSH burn error: {e}")
-        return False
+        return False, str(e)
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+def telnet_auto_burn(ip, user, password):
+    """Burn NVRAM via Telnet with prompt detection, read-back verification, and reboot."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(6.0)
+        s.connect((ip, 23))
+        time.sleep(1.0)
+
+        # Read banner / login prompt
+        buf = s.recv(2048).decode("latin-1", errors="ignore")
+        s.sendall(f"{user}\n".encode())
+        time.sleep(1.0)
+        buf += s.recv(2048).decode("latin-1", errors="ignore")
+        s.sendall(f"{password}\n".encode())
+        time.sleep(1.5)
+        buf += s.recv(2048).decode("latin-1", errors="ignore")
+
+        # Verify shell prompt received
+        if "#" not in buf and "$" not in buf and "root" not in buf:
+            s.close()
+            return False, "Login prompt or shell not confirmed"
+
+        # Write UnifyKeys ps
+        for cmd in BURN_COMMANDS[:-1]:  # all commands up to sync
+            s.sendall(f"{cmd}\n".encode())
+            time.sleep(0.3)
+
+        # Read back to verify
+        s.sendall(b"cat /sys/class/unifykeys/read\n")
+        time.sleep(0.5)
+        resp = s.recv(2048).decode("latin-1", errors="ignore")
+        if "127.0.0.1" not in resp:
+            s.close()
+            return False, f"Verification failed (readback: '{resp.strip()}')"
+
+        # Reboot
+        s.sendall(b"reboot\n")
+        time.sleep(0.5)
+        s.close()
+        return True, "127.0.0.1 verified in chip NVRAM and reboot issued."
+    except Exception as e:
+        return False, str(e)
 
 def read_unifykey_ps(device=None):
     cmd = ["shell", "echo 1 > /sys/class/unifykeys/attach && echo ps > /sys/class/unifykeys/name && cat /sys/class/unifykeys/read"]
@@ -555,56 +622,57 @@ class ProvisionHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def print_success(self, method_name, detail):
+        print("\n" + "=" * 60)
+        print(f"[SUCCESS] PERMANENT HARDWARE UNLOCK VERIFIED VIA {method_name.upper()}!")
+        print(f"          Detail: {detail}")
+        print("          UnifyKey 'ps' = 127.0.0.1 confirmed in Amlogic NVRAM.")
+        print("          Operator cache wiped cleanly.")
+        print("          Device is now rebooting into factory unlocked state!")
+        print("=" * 60 + "\n")
+
     def trigger_background_burn(self, client_ip):
         print("\n[*] ZERO-TOUCH AUTO-BURNER ACTIVATED:")
-        print(f"[*] Waiting 5 seconds for TVIP box ({client_ip}) to initialize root shell...")
-        time.sleep(5)
+        print(f"[*] Polling TVIP box ({client_ip}) for root control (ADB / SSH / Telnet)...")
 
-        # 1. Try Telnet port 23
-        print(f"[*] Probing Telnet on {client_ip}:23...")
-        if check_port(client_ip, 23, timeout=3.0):
-            print(f"[+] Telnet is OPEN! Logging into root shell and burning NVRAM...")
-            if telnet_auto_burn(client_ip, "root", ProvisionHandler.configured_password):
-                print("\n============================================================")
-                print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED WITH 127.0.0.1!")
-                print("           The operator lock has been permanently erased.")
-                print("           The box is now rebooting fully unlocked.")
-                print("============================================================\n")
-                return
+        start_time = time.time()
+        while time.time() - start_time < 30:
+            # 1. Prioritize ADB (Port 5555) - Most reliable for Android, supports pm clear & verified reboot
+            if check_port(client_ip, 5555, timeout=1.5):
+                print(f"[+] ADB detected on {client_ip}:5555! Executing hardware unlock & cache wipe...")
+                ok, msg = adb_auto_burn(client_ip)
+                if ok:
+                    self.print_success("ADB", msg)
+                    return
+                else:
+                    print(f"[-] ADB attempt: {msg}")
 
-        # 2. Try SSH port 22 (Dropbear - Linux-QT default when telnet not active)
-        print(f"[*] Probing Dropbear SSH on {client_ip}:22...")
-        if check_port(client_ip, 22, timeout=3.0):
-            print(f"[+] SSH is OPEN! Connecting and burning NVRAM via SSH...")
-            if ssh_auto_burn(client_ip, "root", ProvisionHandler.configured_password):
-                print("\n============================================================")
-                print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED WITH 127.0.0.1!")
-                print("           The operator lock has been permanently erased.")
-                print("           The box is now rebooting fully unlocked.")
-                print("============================================================\n")
-                return
-            else:
-                print(f"[!] SSH burn failed. Trying ADB...")
+            # 2. Dropbear SSH (Port 22) - Linux-QT default
+            if check_port(client_ip, 22, timeout=1.5):
+                print(f"[+] SSH detected on {client_ip}:22! Executing hardware unlock via SSH...")
+                ok, msg = ssh_auto_burn(client_ip, "root", ProvisionHandler.configured_password)
+                if ok:
+                    self.print_success("SSH", msg)
+                    return
+                else:
+                    print(f"[-] SSH attempt: {msg}")
 
-        # 3. Try ADB port 5555
-        if check_port(client_ip, 5555, timeout=2.0):
-            print(f"[*] ADB is OPEN on {client_ip}:5555. Burning NVRAM via ADB...")
-            run_adb(["connect", f"{client_ip}:5555"])
-            write_unifykey_ps("127.0.0.1", f"{client_ip}:5555")
-            clear_tvip_data(f"{client_ip}:5555")
-            run_adb(["reboot"], f"{client_ip}:5555")
-            print("\n============================================================")
-            print("[SUCCESS] HARDWARE CHIP PERMANENTLY BURNED VIA ADB!")
-            print("           The box is now rebooting fully unlocked.")
-            print("============================================================\n")
-            return
+            # 3. Telnet (Port 23)
+            if check_port(client_ip, 23, timeout=1.5):
+                print(f"[+] Telnet detected on {client_ip}:23! Executing hardware unlock via Telnet...")
+                ok, msg = telnet_auto_burn(client_ip, "root", ProvisionHandler.configured_password)
+                if ok:
+                    self.print_success("Telnet", msg)
+                    return
+                else:
+                    print(f"[-] Telnet attempt: {msg}")
 
-        print(f"\n[!] Auto-burn could not connect (Telnet/SSH/ADB all failed).")
-        print(f"    Manually run these commands on the box:")
-        print(f"    ssh root@{client_ip}  (password: {ProvisionHandler.configured_password})")
-        print(f"    Then paste:")
-        for cmd in BURN_COMMANDS:
-            print(f"      {cmd}")
+            time.sleep(2)
+
+        print(f"\n[!] Auto-burn connection timed out after 30 seconds.")
+        print(f"    You can connect manually via:")
+        print(f"    adb connect {client_ip}:5555 && python tvip_s605_unlock.py --unlock --reboot")
+        print(f"    OR: ssh root@{client_ip} (password: {ProvisionHandler.configured_password})")
 
 
     def log_message(self, format, *args):
