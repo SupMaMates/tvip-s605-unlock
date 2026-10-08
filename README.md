@@ -53,11 +53,6 @@ On every startup and network reconnection of `tv.tvip.app`:
        <pref_tv_autotimeshift visible="false" />
      </pref_tv>
    </preferences>
-
-   <!-- Operator forced OS switch -->
-   <update_types>
-     <device id="s605" force_type="release" force_os="linux-qt" />
-   </update_types>
    ```
 4. **Why local file modifications failed previously:** Any local edits to `/data/data/tv.tvip.app/` were overwritten immediately because the app phoned home to `ps` on every startup and re-applied the operator restrictions.
 
@@ -70,33 +65,54 @@ On standard Android mobile devices, writing to `/sys/` is strictly blocked by Li
 On TVIP's official Android 8.0 firmware for the S-Box 605:
 1. **World-Writable Kernel Driver:** The Amlogic unifykey sysfs interface has world-writable permissions (`-rw-rw-rw-` / `0666`), allowing any user—including the standard ADB `shell` user (`uid=2000`)—to write to the keys.
 2. **SELinux in Permissive Mode:** `getenforce` returns `Permissive`. SELinux does not enforce Mandatory Access Control restrictions against the ADB shell.
-3. **Design Intent:** The TVIP app itself runs as an unprivileged user (`u0_a37`). TVIP left sysfs accessible so their application and factory flashing tools could read and write device identifiers (MAC address, serial number, provision URL) without needing root privileges.
+3. **Design Intent:** The TVIP app itself runs as an unprivileged user (`u0_a23`). TVIP left sysfs accessible so their application and factory flashing tools could read and write device identifiers (MAC address, serial number, provision URL) without needing root privileges.
 
 ---
 
 ## 4. Permanent Unlock Procedure
 
-### Prerequisites
-* Enable USB Debugging or Network ADB on your TVIP box.
-* Connect via ADB:
-  ```powershell
-  adb connect 192.168.1.41:5555  # Replace with your TVIP IP address
-  ```
+### Method A: Automated All-in-One Python Suite (Recommended)
 
----
+Run the included all-in-one suite directly from this repository:
 
-### Method A: Automated Python Tool (Recommended)
-
-Run the included unlock script:
 ```bash
-# Check device state without making changes:
+# 1. Run read-only diagnostics (checks ADB, UnifyKeys, and network ports):
 python tvip_s605_unlock.py --check
 
-# Permanently neutralize the operator lock and reboot:
-python tvip_s605_unlock.py --server 127.0.0.1 --reboot
+# 2. Permanent Hardware Unlock (neutralizes NVRAM lock & wipes app cache):
+python tvip_s605_unlock.py --unlock --reboot
+
+# 3. Linux-QT & Android Provision Server Mode (serves XML, unlocks UI, enables SSH/Telnet root shell):
+python tvip_s605_unlock.py --serve --password toor
+
+# 4. Optional: inject your custom Stalker / MAG portal directly into the provisioning feed:
+python tvip_s605_unlock.py --serve --portal "http://your-stalker-portal.com"
 ```
 
 ---
+
+## 5. Linux-QT Firmware: Root Shell Activation
+
+Inside `system.img` of the TVIP Linux-QT firmware, **Dropbear (SSH)** and **Telnet** are pre-installed. The startup scripts (`/etc/init.d/S50dropbear` and `/etc/init.d/S50telnetd`) activate automatically when `/var/tvip/password` exists.
+
+This file is created automatically when `tvip_provision.xml` contains the `<shell>` tag:
+```xml
+<system_locks>
+  <shell password="YOUR_ROOT_PASSWORD" />
+</system_locks>
+```
+
+Running `python tvip_s605_unlock.py --serve --password toor` generates this configuration and hosts it on port 80. Once the box boots and checks in:
+1. It downloads the XML and generates the password.
+2. Dropbear SSH (Port 22) and Telnet (Port 23) launch automatically.
+3. You can log into a root Linux shell immediately:
+   ```bash
+   ssh root@<TVIP_IP>
+   # or
+   telnet <TVIP_IP>
+   # Password: toor
+   ```
+
 
 ### Method B: Manual ADB Commands
 
@@ -113,8 +129,6 @@ Verify that the key updated:
 adb shell "echo 1 > /sys/class/unifykeys/attach && echo ps > /sys/class/unifykeys/name && cat /sys/class/unifykeys/read"
 # Expected output: 127.0.0.1
 ```
-
-> **Note on Mutex Locking:** Always ensure `echo 0 > /sys/class/unifykeys/lock` is executed to release the kernel mutex lock after writing.
 
 #### Step 2: Clear Application Data & Cached Operator Config
 ```bash
@@ -134,7 +148,6 @@ On the TV screen with the remote control:
 ## 5. Configuring Your Custom IPTV / Stalker / MAG Portal
 
 Once unlocked, the TVIP app runs in its unrestricted factory mode:
-
 1. From the TVIP home screen, navigate down to the **Settings** row and select **TV**.
 2. Navigate down to **Content source:** (press Left/Right on your remote control to cycle through options):
    * **IPTV-portal:** Enter Login, Password, and Server URL.
@@ -151,26 +164,11 @@ This modification is **permanent** and survives:
 * Cold reboots and power disconnections.
 * Internet reconnections across Ethernet and Wi-Fi.
 * Clearing application cache or reinstalling apps.
-* **Android factory resets:** Amlogic UnifyKeys resides in a separate raw NVRAM/eMMC key partition (`/dev/block/param` / `cri_data`) unaffected by `/data` user data wipes.
+* Android factory resets (Amlogic UnifyKeys resides in a separate raw NVRAM/eMMC partition unaffected by user data wipes).
 
-### Additional Safeguard: Preventing Forced Linux-QT Updates
-Because the operator provisioning server is neutralized to `127.0.0.1`, the device will **never** receive the instruction `<device id="s605" force_os="linux-qt" />`. Your Android 8.0 OS installation is completely protected from unwanted provider firmware changes.
-
----
-
-## 7. Rollback / Emergency Recovery
-
-### Software Rollback (Restore Original Operator)
+### Rollback / Restoring Operator Configuration
 If you ever need to restore the original operator configuration:
 ```bash
 adb shell "echo 1 > /sys/class/unifykeys/attach && echo 1 > /sys/class/unifykeys/lock && echo ps > /sys/class/unifykeys/name && echo dreambox.for-better.biz > /sys/class/unifykeys/write && echo 0 > /sys/class/unifykeys/lock"
 adb shell pm clear tv.tvip.app
 ```
-
-### Hardware Recovery (AV Jack Toothpick Method)
-If the device ever fails to boot or becomes unresponsive:
-1. Disconnect the power cable.
-2. Insert a toothpick or non-conductive pin into the **AV jack** on the rear panel until you feel the physical reset switch depress.
-3. Hold the switch down while reconnecting power.
-4. Continue holding for 8–10 seconds until the Android Recovery screen appears.
-5. Select **Wipe data / factory reset** to return to clean factory defaults.

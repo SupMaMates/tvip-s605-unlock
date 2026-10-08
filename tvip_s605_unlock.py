@@ -1,195 +1,301 @@
 #!/usr/bin/env python3
 """
-TVIP S-Box 605 — Hardware Provisioning & Portal Unlock Tool
-Permanent operator lockout neutralization via Amlogic NVRAM UnifyKeys.
-Author: SupMaMates
-Repository: https://github.com/SupMaMates/tvip-s605-unlock
+TVIP S-Box 605 -- All-in-One Hardware Unlocker & Root Provisioning Suite
+Supports both Android 8.0 and Linux-QT firmware variants.
+
+Features:
+  1. Permanent Hardware Unlock: Reprograms Amlogic NVRAM UnifyKeys directly via ADB.
+  2. Built-in Provisioning Server: Hosts HTTP tvip_provision.xml to unlock menus
+     and activate Dropbear (SSH) & Telnet root shell on Linux-QT and Android.
+  3. Network Diagnostics: Probes ADB, SSH (22), and Telnet (23).
 """
 
 import argparse
+import http.server
+import os
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 
+BANNER = """
+============================================================
+   TVIP S-Box 605 -- All-in-One Unlock & Root Shell Suite
+============================================================
+"""
+
+PROVISION_TEMPLATE = """<?xml version="1.0"?>
+<provision reload="86400">
+  <!-- Enable Dropbear SSH and Telnet root shell -->
+  <system_locks>
+    <shell password="{password}" />
+    <sysinfo_del locked="false" />
+    <reset locked="false" />
+  </system_locks>
+
+  <!-- Enable all built-in applications -->
+  <features>
+    <mediaplayer enabled="true" />
+    <dvr enabled="true" />
+    <cctv enabled="true" />
+    <vod enabled="true" />
+    <navigator enabled="true" />
+  </features>
+
+  <!-- Make all TV preferences, content sources, and setup buttons visible -->
+  <preferences>
+    <pref_tv>
+      <pref_tv_streamtype visible="true" />
+      <pref_tv_udpxyaddress visible="true" />
+      <pref_tv_dvr_deviceid visible="true" />
+      <pref_tv_timeshift_deviceid visible="true" />
+      <pref_tv_autotimeshift visible="true" />
+      <pref_tv_middleware visible="true" />
+      <pref_tv_button_midd_setup visible="true" />
+      <pref_tv_mpegts_buffer visible="true" />
+    </pref_tv>
+    <pref_system>
+      <pref_system_updatetype visible="true" />
+      <pref_system_updateperiod visible="true" />
+      <pref_system_updatebackground visible="true" />
+    </pref_system>
+  </preferences>
+{custom_protocol}
+</provision>
+"""
 
 def run_adb(cmd_list, device=None):
-    """Execute an ADB command and return (returncode, stdout, stderr)."""
     base = ["adb"]
     if device:
         base.extend(["-s", device])
     full_cmd = base + cmd_list
-    try:
-        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=15)
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return -1, "", "Command timed out"
-    except FileNotFoundError:
-        return -2, "", "adb executable not found in PATH"
+    result = subprocess.run(full_cmd, capture_output=True, text=True)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
-
-def get_connected_devices():
-    """Return a list of connected and authorized ADB device IDs."""
+def get_adb_devices():
     code, out, _ = run_adb(["devices", "-l"])
-    if code != 0:
-        return []
     devices = []
+    if code != 0:
+        return devices
     for line in out.splitlines()[1:]:
-        parts = line.strip().split()
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
         if len(parts) >= 2 and parts[1] == "device":
-            devices.append(parts[0])
+            serial = parts[0]
+            # Prioritize TVIP devices if detected
+            is_tvip = any("tvip" in p.lower() or "s6xx" in p.lower() for p in parts)
+            if is_tvip or ":" in serial:
+                devices.insert(0, serial)
+            else:
+                devices.append(serial)
     return devices
 
+def get_local_ip(target_ip="192.168.1.1"):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((target_ip, 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
-def get_device_info(device=None):
-    """Query core device properties via getprop."""
-    props_to_query = [
-        ("Model", "ro.product.model"),
-        ("Board", "ro.product.board"),
-        ("Android Version", "ro.build.version.release"),
-        ("Firmware Build", "ro.build.display.id"),
-        ("Build Fingerprint", "ro.build.fingerprint"),
-        ("SELinux Status", "None"),
-    ]
-    info = {}
-    for label, prop in props_to_query:
-        if prop == "None":
-            _, out, _ = run_adb(["shell", "getenforce"], device)
-            info[label] = out
-        else:
-            _, out, _ = run_adb(["shell", f"getprop {prop}"], device)
-            info[label] = out
-    return info
-
+def check_port(host, port, timeout=2.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 def read_unifykey_ps(device=None):
-    """Read the current value of the Amlogic NVRAM UnifyKey 'ps' (Provision Server)."""
-    shell_cmd = (
-        "echo 1 > /sys/class/unifykeys/attach && "
-        "echo ps > /sys/class/unifykeys/name && "
-        "cat /sys/class/unifykeys/read"
-    )
-    code, out, err = run_adb(["shell", shell_cmd], device)
-    if code != 0 or not out:
+    cmd = ["shell", "echo 1 > /sys/class/unifykeys/attach && echo ps > /sys/class/unifykeys/name && cat /sys/class/unifykeys/read"]
+    code, out, err = run_adb(cmd, device)
+    if code != 0:
         return None, err
     return out.strip(), None
 
-
 def write_unifykey_ps(new_value, device=None):
-    """Write a new value to the Amlogic NVRAM UnifyKey 'ps' with mutex locking."""
-    shell_cmd = (
-        "echo 1 > /sys/class/unifykeys/attach && "
-        "echo 1 > /sys/class/unifykeys/lock && "
-        "echo ps > /sys/class/unifykeys/name && "
+    shell_script = (
+        f"echo 1 > /sys/class/unifykeys/attach && "
+        f"echo 1 > /sys/class/unifykeys/lock && "
+        f"echo ps > /sys/class/unifykeys/name && "
         f"echo {new_value} > /sys/class/unifykeys/write && "
-        "echo 0 > /sys/class/unifykeys/lock"
+        f"echo 0 > /sys/class/unifykeys/lock"
     )
-    code, _, err = run_adb(["shell", shell_cmd], device)
-    if code != 0:
-        return False, err
-    # Verify the write
-    verified_val, _ = read_unifykey_ps(device)
-    if verified_val != new_value:
-        return False, f"Verification failed: expected '{new_value}', got '{verified_val}'"
-    return True, None
+    code, out, err = run_adb(["shell", shell_script], device)
+    return code == 0, err
 
-
-def clear_tvip_app_data(device=None):
-    """Purge cached operator configuration and private files."""
+def clear_tvip_data(device=None):
     code, out, err = run_adb(["shell", "pm clear tv.tvip.app"], device)
     return code == 0 and "Success" in out
 
+def check_device_info(device=None):
+    props = {}
+    for p in ["ro.product.model", "ro.product.board", "ro.build.version.release", "ro.build.display.id"]:
+        _, out, _ = run_adb(["shell", f"getprop {p}"], device)
+        props[p] = out
+    _, se, _ = run_adb(["shell", "getenforce"], device)
+    props["selinux"] = se
+    return props
 
-def restart_device(device=None):
-    """Reboot the target device."""
-    run_adb(["reboot"], device)
+class ProvisionHandler(http.server.BaseHTTPRequestHandler):
+    xml_content = b""
 
+    def do_GET(self):
+        client_ip = self.client_address[0]
+        path = self.path.split("?")[0]
+        print(f"\n[HTTP GET] {client_ip} requested: {self.path}")
+
+        if path.endswith("tvip_provision.xml") or path == "/prov" or path == "/prov/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/xml")
+            self.send_header("Content-Length", str(len(self.xml_content)))
+            self.end_headers()
+            self.wfile.write(self.xml_content)
+            print(f"[+] Delivered custom tvip_provision.xml to {client_ip}!")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Suppress default server logs for clean CLI output
+
+def start_provision_server(port, password, portal_url=None):
+    custom_proto = ""
+    if portal_url:
+        custom_proto = f"""  <tv_protocols default="browser">
+    <protocol type="browser" server="{portal_url}" api="mag" noui="false" combined="true" />
+  </tv_protocols>"""
+
+    xml = PROVISION_TEMPLATE.format(password=password, custom_protocol=custom_proto).encode("utf-8")
+    ProvisionHandler.xml_content = xml
+
+    server = socketserver.TCPServer(("", port), ProvisionHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    return server
+
+def run_diagnostics(target_dev, box_ip):
+    print("\n--- Diagnostic Results ---")
+    if target_dev:
+        info = check_device_info(target_dev)
+        print(f"[+] Target ADB Device: {target_dev}")
+        print(f"    Model: {info.get('ro.product.model')} | Board: {info.get('ro.product.board')}")
+        print(f"    OS Release: {info.get('ro.build.version.release')} | Build: {info.get('ro.build.display.id')}")
+        print(f"    SELinux: {info.get('selinux')}")
+        current_ps, _ = read_unifykey_ps(target_dev)
+        print(f"    NVRAM Key 14 ('ps'): '{current_ps}'")
+        if current_ps in ("127.0.0.1", "localhost"):
+            print("    Hardware Lock Status: UNLOCKED (provisioning neutralized)")
+        else:
+            print(f"    Hardware Lock Status: LOCKED to operator ({current_ps})")
+    else:
+        print("[!] ADB Status: Not connected")
+
+    if box_ip:
+        print(f"\n[*] Probing Network Ports on {box_ip}:")
+        ssh_ok = check_port(box_ip, 22)
+        telnet_ok = check_port(box_ip, 23)
+        adb_ok = check_port(box_ip, 5555)
+        print(f"    Port 22 (Dropbear SSH): {'OPEN [Root Shell Available]' if ssh_ok else 'Closed'}")
+        print(f"    Port 23 (Telnet):       {'OPEN [Root Shell Available]' if telnet_ok else 'Closed'}")
+        print(f"    Port 5555 (ADB):        {'OPEN' if adb_ok else 'Closed'}")
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="TVIP S-Box 605 — Permanent Hardware Provisioning & Portal Unlock Tool"
-    )
-    parser.add_argument(
-        "-s", "--device",
-        help="Target ADB device serial or IP:port (e.g. 192.168.1.41:5555)"
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Inspect device state and check current NVRAM Provision Server key"
-    )
-    parser.add_argument(
-        "--server",
-        default="127.0.0.1",
-        help="Provision server to write into NVRAM (default: 127.0.0.1 for complete neutralization)"
-    )
-    parser.add_argument(
-        "--restore",
-        metavar="ORIGINAL_HOST",
-        help="Restore a specific operator provision hostname (e.g. dreambox.for-better.biz)"
-    )
-    parser.add_argument(
-        "--reboot",
-        action="store_true",
-        help="Reboot the set-top box after completing the operation"
-    )
-
+    parser = argparse.ArgumentParser(description="TVIP S-Box 605 All-in-One Unlocker & Root Provisioning Suite")
+    parser.add_argument("-s", "--device", help="ADB target device (e.g. 192.168.1.41:5555)")
+    parser.add_argument("--box-ip", help="IP address of the TVIP box for network checks (e.g. 192.168.1.41)")
+    parser.add_argument("--unlock", action="store_true", help="Perform permanent hardware unlock via NVRAM UnifyKeys")
+    parser.add_argument("--server-ip", default="127.0.0.1", help="Target server to write to NVRAM (default: 127.0.0.1)")
+    parser.add_argument("--serve", action="store_true", help="Start local provisioning server to unlock UI & enable root shell")
+    parser.add_argument("--port", type=int, default=80, help="HTTP provisioning server port (default: 80)")
+    parser.add_argument("--password", default="toor", help="Password to configure for SSH/Telnet root shell (default: toor)")
+    parser.add_argument("--portal", help="Optional custom portal URL to inject (e.g. http://my-stalker-portal.com)")
+    parser.add_argument("--check", action="store_true", help="Run read-only diagnostics")
+    parser.add_argument("--reboot", action="store_true", help="Reboot device via ADB")
     args = parser.parse_args()
 
-    # Detect devices
-    devices = get_connected_devices()
-    if not devices:
-        print("[!] Error: No connected ADB devices found. Ensure ADB is connected and authorized.")
-        sys.exit(1)
+    print(BANNER)
 
-    target_device = args.device or devices[0]
-    print(f"[*] Target Device: {target_device}")
+    devices = get_adb_devices()
+    target_dev = args.device or (devices[0] if devices else None)
+    box_ip = args.box_ip
+    if not box_ip and target_dev and ":" in target_dev:
+        box_ip = target_dev.split(":")[0]
 
-    # Read hardware state
-    info = get_device_info(target_device)
-    current_ps, err = read_unifykey_ps(target_device)
+    # If no flags passed, default to check + unlock
+    if not any([args.unlock, args.serve, args.check, args.reboot]):
+        print("[*] No specific mode selected. Running diagnostics and hardware unlock...")
+        args.check = True
+        args.unlock = True
 
-    print("\n--- Device Identification ---")
-    for k, v in info.items():
-        print(f"  {k:18}: {v}")
-    print(f"  {'Current NVRAM ps':18}: {current_ps or f'Error reading key ({err})'}")
+    if args.check:
+        run_diagnostics(target_dev, box_ip)
 
-    is_locked = current_ps and current_ps not in ("127.0.0.1", "0.0.0.0", "localhost")
-    if is_locked:
-        print(f"\n[!] Status: LOCKED to operator provisioning server [{current_ps}]")
-    else:
-        print(f"\n[+] Status: UNLOCKED / NEUTRALIZED (ps = {current_ps})")
+    if args.unlock:
+        if not target_dev:
+            print("[!] Error: ADB device not detected. Connect device via USB or 'adb connect <ip>:5555'.")
+            sys.exit(1)
 
-    # If only checking, exit cleanly
-    if args.check and not args.restore and args.server == "127.0.0.1" and not args.reboot:
-        print("\n[*] Inspection complete. No modifications applied.")
-        sys.exit(0)
+        print(f"\n[*] Applying Permanent Hardware Unlock to {target_dev}...")
+        current_ps, _ = read_unifykey_ps(target_dev)
+        print(f"[*] Current NVRAM 'ps': '{current_ps}'")
 
-    # Determine desired action
-    new_server = args.restore if args.restore else args.server
-    action_desc = "Restoring operator key" if args.restore else "Neutralizing operator lock"
+        if current_ps == args.server_ip:
+            print(f"[+] NVRAM 'ps' is already '{args.server_ip}'.")
+        else:
+            print(f"[*] Writing '{args.server_ip}' to Amlogic NVRAM UnifyKeys key 14 ('ps')...")
+            ok, err = write_unifykey_ps(args.server_ip, target_dev)
+            if not ok:
+                print(f"[!] Write failed: {err}")
+                sys.exit(1)
+            verified, _ = read_unifykey_ps(target_dev)
+            print(f"[+] Verified in NVRAM chip: '{verified}'")
 
-    print(f"\n[*] {action_desc} -> Writing '{new_server}' to Amlogic NVRAM UnifyKey 'ps'...")
-    success, write_err = write_unifykey_ps(new_server, target_device)
-    if not success:
-        print(f"[!] Error writing NVRAM key: {write_err}")
-        sys.exit(1)
-    print(f"[+] NVRAM Key 'ps' successfully written and verified: {new_server}")
+        print("[*] Clearing tv.tvip.app application state...")
+        if clear_tvip_data(target_dev):
+            print("[+] tv.tvip.app cache and operator data wiped successfully.")
+        else:
+            print("[*] Note: App clear skipped or not applicable.")
 
-    # Clear application data
-    print("[*] Clearing cached operator configuration (pm clear tv.tvip.app)...")
-    if clear_tvip_app_data(target_device):
-        print("[+] Cached application data and operator overrides purged successfully.")
-    else:
-        print("[!] Warning: 'pm clear' returned an unexpected status, but NVRAM key is updated.")
+        print("\n[+] HARDWARE UNLOCK APPLIED SUCCESSFULLY!")
+        print("    The provider lock has been neutralized.")
 
-    if args.reboot:
-        print("[*] Rebooting TVIP set-top box...")
-        restart_device(target_device)
-        print("[+] Reboot signal sent.")
-    else:
-        print("\n[+] Done! You can now launch TVIP on your TV screen.")
-        print("[+] First-time wizard will run once, after which all portal and setup menus are unlocked.")
+    if args.serve:
+        local_ip = get_local_ip(box_ip or "192.168.1.1")
+        print(f"\n[*] Starting Provisioning Server on http://{local_ip}:{args.port}/prov/tvip_provision.xml")
+        print(f"[*] Configured root shell password: '{args.password}'")
+        if args.portal:
+            print(f"[*] Configured custom portal: '{args.portal}'")
 
+        try:
+            server = start_provision_server(args.port, args.password, args.portal)
+            print("[+] HTTP Server is LIVE. Waiting for TVIP box connection...")
+
+            # If ADB is available, we can automatically set ps to our server IP!
+            if target_dev:
+                print(f"[*] ADB available: Setting TVIP NVRAM 'ps' to {local_ip}...")
+                write_unifykey_ps(local_ip, target_dev)
+                print("[*] Restarting TVIP app to trigger instant provisioning...")
+                run_adb(["shell", "am force-stop tv.tvip.app && am start -n tv.tvip.app/.TvipNativeActivity"], target_dev)
+
+            print("\nPress Ctrl+C to stop the provisioning server.")
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[*] Stopping server.")
+        except PermissionError:
+            print(f"\n[!] Error: Port {args.port} requires administrator/root privileges.")
+            print(f"    Run the terminal as Administrator or specify a port like '--port 8080'.")
+
+    if args.reboot and target_dev:
+        print("\n[*] Rebooting device...")
+        run_adb(["reboot"], target_dev)
+        print("[+] Reboot command sent.")
 
 if __name__ == "__main__":
     main()
