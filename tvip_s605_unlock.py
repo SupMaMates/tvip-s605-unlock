@@ -375,34 +375,84 @@ def configure_windows_hotspot(ssid="TVIP-UNLOCK", password="12345678"):
 # Hosts File DNS Redirect Management
 # =========================================================================
 
+def _build_hosts_block(redirect_ip, domains):
+    lines = [HOSTS_TAG_START]
+    for d in domains:
+        lines.append(f"{redirect_ip:<16} {d}")
+    lines.append(HOSTS_TAG_END)
+    return "\n".join(lines)
+
 def apply_hosts_redirect(redirect_ip, domains):
     global _hosts_modified
-    if not is_admin():
-        return False
+
+    block = _build_hosts_block(redirect_ip, domains)
+
+    # Strategy 1: Direct Python write (works if truly elevated)
     try:
-        content = ""
-        if os.path.exists(HOSTS_PATH):
-            with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
+        with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
         if HOSTS_TAG_START in content:
-            remove_hosts_redirect()
-            with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
-        lines = [f"\n{HOSTS_TAG_START}"]
-        for d in domains:
-            lines.append(f"{redirect_ip:<16} {d}")
-        lines.append(f"{HOSTS_TAG_END}\n")
-
+            return True  # Already applied
         with open(HOSTS_PATH, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
+            f.write(f"\n{block}\n")
         _hosts_modified = True
         return True
+    except PermissionError:
+        pass
     except Exception as e:
-        print(f"[!] Warning: Could not modify hosts file automatically: {e}")
-        return False
+        print(f"[!] Direct write failed: {e}")
+
+    # Strategy 2: PowerShell Add-Content via elevated Start-Process -Wait
+    try:
+        escaped_block = block.replace('"', '`"').replace('\n', '`n')
+        ps_cmd = (
+            f'Add-Content -Path \\"{HOSTS_PATH}\\" '
+            f'-Value \\"{escaped_block}\\" -Encoding ASCII'
+        )
+        outer = (
+            f'Start-Process powershell '
+            f'-ArgumentList "-NoProfile -Command {ps_cmd}" '
+            f'-Verb RunAs -Wait -WindowStyle Hidden'
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", outer],
+            capture_output=True, text=True, timeout=15
+        )
+        # Verify it worked
+        with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            if HOSTS_TAG_START in f.read():
+                _hosts_modified = True
+                return True
+    except Exception:
+        pass
+
+    # Strategy 3: Generate a helper batch file and ask user to run it
+    bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apply_dns_redirect.bat")
+    try:
+        bat_lines = [
+            "@echo off",
+            "echo Applying TVIP unlock DNS redirect...",
+            f'echo {HOSTS_TAG_START}>> "{HOSTS_PATH}"',
+        ]
+        for d in domains:
+            bat_lines.append(f'echo {redirect_ip:<16} {d}>> "{HOSTS_PATH}"')
+        bat_lines += [
+            f'echo {HOSTS_TAG_END}>> "{HOSTS_PATH}"',
+            "echo Done! You can close this window.",
+            "pause"
+        ]
+        with open(bat_path, "w") as f:
+            f.write("\n".join(bat_lines))
+
+        print(f"\n[*] Generated helper: {bat_path}")
+        print(f"[*] Right-click that file → 'Run as administrator' to apply DNS redirect.")
+        print(f"[*] Then press ENTER here to continue.\n")
+        # Auto-launch it elevated via ShellExecuteW
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", bat_path, None, None, 1)
+    except Exception as e:
+        print(f"[!] Could not generate helper bat: {e}")
+
+    return False
 
 def remove_hosts_redirect():
     global _hosts_modified
